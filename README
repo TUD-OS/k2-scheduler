@@ -1,0 +1,64 @@
+
+	    K2 - A prototype of a work-constraining I/O scheduler
+	    		Copyright (c) 2019 Till Miemietz
+
+K2 is a simple prototype of a work-constraining I/O scheduler. It is primarily
+designed to achieve some form of real-time guarantees on SSDs without 
+modifying the storage hardware. The core idea of the scheduler is to restrict 
+the amount of requests visible to the drive and thus being able to react faster 
+on newly incoming high-priority workload. Of course, this involves a tradeoff
+between request latency and achieved bandwidth. For a full discussion the 
+performance of this scheduler see also the paper "K2: Work-Constraining 
+Scheduling of NVMe-Attached Storage".
+
+
+How to build and run the scheduler
+----------------------------------
+
+Building this kernel module requires a build environment for the Linux kernel.
+As of now, building and running the scheduler has been tested for kernel 
+version 4.15.0.
+To compile the module, run
+
+make
+
+Afterwards the binary can be inserted into the module directory by executing
+
+make install
+
+To load K2 into the running kernel, use
+
+modprobe k2
+
+Lastly, the I/O scheduler has to be activated by writing the string "k2" into
+the sysfs file /sys/block/<device name>/queue/scheduler.
+Please note that K2 will only work with the multi-queue block layer of Linux.
+To enable this feature, add scsi_mod.use_blk_mq=1 to your bootloader 
+configuration. Reboot the system afterwards.
+
+
+How to use K2
+-------------
+
+Internally, K2 maintains distinct queues for every priority of the real-time
+I/O priority class and one combined queue for requests of the idle and 
+best-effort class. To be classified correctly, applications have to set their
+I/O priority by using tools like ionice. Also refer to the manpage of ionice for
+a brief discussion of I/O priority concepts in general. If a process does not 
+have an ioprio assigned, a priority will be derived from the process' nice 
+value. K2 strictly favors real-time workload over any other requests. Inside 
+the real-time priority class, workload with higher priority numbers will always
+be served before requests with lower priority numbers. Pay attention to the fact
+that in the current state of implementation, K2 does not consider fairness
+between different priority levels. Processes with a high ionice value may starve
+requests of applications with lower priority. Requests that belong to the same
+queue are served in FIFO order.
+
+The second parameter for tuning K2 is the number of requests that can be 
+in flight against a device simultaneously. This tunable can be altered by 
+writing the desired value to the file 
+/sys/block/<device name>/queue/iosched/max_inflight. The default configuration
+of K2 allows 32 requests to be in flight at the same time. Note that the lower
+the inflight parameter, the better the achieved I/O latency will be. However 
+this is accomplished at the expense of the throughput that this device will 
+offer.
