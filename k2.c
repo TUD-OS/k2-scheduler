@@ -43,6 +43,28 @@ ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
 ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s, 
                             size_t size);
 
+static int ioprio_from_current(void)
+{
+	int prio;
+
+	/* if task has no io prio, derive it from its nice value */
+	if (current->io_context != NULL &&
+		ioprio_valid(current->io_context->ioprio)) {
+		prio = current->io_context->ioprio;
+	} else {
+		prio = IOPRIO_PRIO_VALUE(task_nice_ioclass(current), IOPRIO_NORM);
+	}
+
+	if (IOPRIO_PRIO_CLASS(prio) == IOPRIO_CLASS_RT) {
+		int value = IOPRIO_PRIO_DATA(prio);
+		/* can this happen??? */
+		if (value >= IOPRIO_BE_NR || value < 0)
+			prio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, IOPRIO_NORM);
+	}
+
+	return(prio);
+}
+
 struct k2_data {
 	unsigned int inflight;
 	unsigned int max_inflight;
@@ -196,41 +218,30 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	return(has_work);
 }
 
+static struct list_head* k2_queue_prio(struct k2_data * k2d, const int prio)
+{
+	// can we make a linear array out of it?
+	if (IOPRIO_PRIO_CLASS(prio) == IOPRIO_CLASS_RT) {
+		return(&k2d->rt_reqs[IOPRIO_PRIO_DATA(prio)]);
+	} else {
+		return(&k2d->be_reqs);
+	}
+}
+
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
 void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
                         bool at_head) 
 {
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
+	const int prio = ioprio_from_current();
+	struct list_head *k2_queue = k2_queue_prio(k2d, prio);
+	struct list_head *cur, *tmp;
 
 	spin_lock_irqsave(&k2d->lock, flags);
-	while (!list_empty(rqs)) {
-		struct request *r;
-		int    prio_class;
-		int    prio_value = IOPRIO_NORM;
-
-		r = list_first_entry(rqs, struct request, queuelist);
-		list_del_init(&r->queuelist);
-
-		/* if task has no io prio, derive it from its nice value */
-		if (current->io_context != NULL && 
-			ioprio_valid(current->io_context->ioprio)) {
-			prio_class = IOPRIO_PRIO_CLASS(
-						current->io_context->ioprio);
-			prio_value = IOPRIO_PRIO_VALUE(prio_class, 
-						current->io_context->ioprio);
-		} else {
-			prio_class = task_nice_ioclass(current);
-		}
-       
-		if (prio_class == IOPRIO_CLASS_RT) {
-			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
-				prio_value = IOPRIO_NORM;
-
-			list_add_tail(&r->queuelist, &k2d->rt_reqs[prio_value]);
-		} else {
-			list_add_tail(&r->queuelist, &k2d->be_reqs);
-		}
+	list_for_each_safe(cur, tmp, rqs) {
+		struct request * r = list_entry(cur, struct request, queuelist);
+		list_move_tail(cur, k2_queue);
 
 		/* leave a message for tracing */
 		blk_mq_sched_request_inserted(r);
