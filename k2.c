@@ -162,38 +162,24 @@ static void k2_completed_request(struct request *r)
 		blk_mq_run_hw_queues(r->q, true);
 }
 
-static bool _k2_has_work(struct k2_data *k2d)
-{
-	unsigned int  i;
-
-	assert_spin_locked(&k2d->lock);
-
-	if (k2d->inflight >= k2d->max_inflight)
-		return(false);
-
-	if (! list_empty(&k2d->be_reqs))
-		return(true);
-
-	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (list_empty(&k2d->rt_reqs[i])) {
-			return(true);
-		}
-	}
-
-	return(false);
-}
-
 static bool k2_has_work(struct blk_mq_hw_ctx *hctx) 
 {
+	unsigned int i;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
-	bool has_work;
-	unsigned long flags;
-
-	spin_lock_irqsave(&k2d->lock, flags);
-	has_work = _k2_has_work(k2d);
-	spin_unlock_irqrestore(&k2d->lock, flags);
     
-	return(has_work);
+	if (READ_ONCE(&k2d->inflight) >= READ_ONCE(&k2d->max_inflight))
+		return (false);
+
+	if (!list_empty_careful(&k2d->be_reqs))
+		return (true);
+
+	for (i = 0; i < IOPRIO_BE_NR; i++) {
+		if (list_empty_careful(&k2d->rt_reqs[i])) {
+			return (true);
+		}
+	}
+    
+	return (false);
 }
 
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
@@ -272,8 +258,8 @@ abort:
 	return(NULL);
 
 end:
+	++k2d->inflight;
 	list_del_init(&r->queuelist);
-	k2d->inflight++;
 	r->rq_flags |= RQF_STARTED;
 	spin_unlock_irqrestore(&k2d->lock, flags);
 	return(r);
