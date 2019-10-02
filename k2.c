@@ -68,15 +68,18 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 {
 
 	struct k2_data *k2d = eq->elevator_data;
+	unsigned int old_max;
 	unsigned int new_max;
 	unsigned long flags;
 
 	if (kstrtouint(s, 10, &new_max) >= 0) {
 		spin_lock_irqsave(&k2d->lock, flags);
+		old_max           = k2d->max_inflight;
 		k2d->max_inflight = new_max;
 		spin_unlock_irqrestore(&k2d->lock, flags);
 		printk(KERN_INFO "k2: max_inflight set to %u\n", 
 			k2d->max_inflight);
+		
 		return(size);
 	}
 
@@ -147,25 +150,25 @@ static void k2_completed_request(struct request *r)
 		blk_mq_run_hw_queues(r->q, true);
 }
 
-static bool _k2_has_work(struct k2_data * k2d)
+static bool _k2_has_work(struct k2_data *k2d)
 {
 	unsigned int  i;
 
 	assert_spin_locked(&k2d->lock);
 
 	if (k2d->inflight >= k2d->max_inflight)
-		return false;
+		return(false);
 
-	if (!list_empty(&k2d->be_reqs))
-		return true;
+	if (! list_empty(&k2d->be_reqs))
+		return(true);
 
 	for (i = 0; i < IOPRIO_BE_NR; i++) {
 		if (list_empty(&k2d->rt_reqs[i])) {
-			return true;
+			return(true);
 		}
 	}
 
-	return false;
+	return(false);
 }
 
 static bool k2_has_work(struct blk_mq_hw_ctx *hctx) 
