@@ -147,25 +147,35 @@ static void k2_completed_request(struct request *r)
 		blk_mq_run_hw_queues(r->q, true);
 }
 
+static bool _k2_has_work(struct k2_data * k2d)
+{
+	unsigned int  i;
+
+	assert_spin_locked(&k2d->lock);
+
+	if (k2d->inflight >= k2d->max_inflight)
+		return false;
+
+	if (!list_empty(&k2d->be_reqs))
+		return true;
+
+	for (i = 0; i < IOPRIO_BE_NR; i++) {
+		if (list_empty(&k2d->rt_reqs[i])) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static bool k2_has_work(struct blk_mq_hw_ctx *hctx) 
 {
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
-	bool has_work = false;
+	bool has_work;
 	unsigned long flags;
-	unsigned int  i;
 
 	spin_lock_irqsave(&k2d->lock, flags);
-	if (k2d->inflight < k2d->max_inflight) { 
-		if (!list_empty(&k2d->be_reqs))
-			has_work = true;
-			
-		for (i = 0; i < IOPRIO_BE_NR; i++) {
-			if (list_empty(&k2d->rt_reqs[i])) {
-				has_work = true;
-				break;
-			}
-		}
-	}
+	has_work = _k2_has_work(k2d);
 	spin_unlock_irqrestore(&k2d->lock, flags);
     
 	return(has_work);
