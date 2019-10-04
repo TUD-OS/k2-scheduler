@@ -28,8 +28,14 @@
 #include <linux/blk-mq.h>
 #include <linux/ioprio.h>
 
-#include <../block/blk-mq.h>
-#include <../block/blk-mq-sched.h>
+/*
+ * blk_mq_sched_request_inserted() is EXPORT_SYMBOL_GPL'ed, but it is declared
+ * in the header file block/blk-mq-sched.h, which is not part of the installed
+ * kernel headers a module is built against (only part of the full source).
+ * Therefore, we forward-declare it again here.
+ * (implicitly declared functions are an error.)
+ */
+void blk_mq_sched_request_inserted(struct request *rq);
 
 /* helper functions for getting / setting configurations via sysfs */
 ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
