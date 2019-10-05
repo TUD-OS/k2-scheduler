@@ -35,7 +35,7 @@
  * Therefore, we forward-declare it again here.
  * (implicitly declared functions are an error.)
  */
-void blk_mq_sched_request_inserted(struct request *rq);
+extern void blk_mq_sched_request_inserted(struct request *rq);
 
 /* helper functions for getting / setting configurations via sysfs */
 ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
@@ -137,14 +137,20 @@ static void k2_completed_request(struct request *r)
 {
 	struct k2_data *k2d = r->q->elevator->elevator_data;
 	unsigned long flags;
-	unsigned long counter;
+	unsigned int  counter;
+	unsigned int  max_inf; 
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	/* avoid negative counters */
 	if (k2d->inflight > 0)
 		k2d->inflight--;
 
+	/* 
+	 * Read both counters here to avoid stall situation if max_inflight  
+	 * is modified simultaneously.
+	 */
 	counter = k2d->inflight;
+	max_inf = k2d->max_inflight;
 	spin_unlock_irqrestore(&k2d->lock, flags);
 
 	/* 
@@ -152,7 +158,7 @@ static void k2_completed_request(struct request *r)
 	 * Rerunning the hw queues have to be done manually since we throttle
 	 * request dispatching. Mind that this has to be executed in async mode.
 	 */
-	if (counter == (k2d->max_inflight - 1))
+	if (counter == (max_inf - 1))
 		blk_mq_run_hw_queues(r->q, true);
 }
 
