@@ -36,6 +36,8 @@
  * (implicitly declared functions are an error.)
  */
 extern void blk_mq_sched_request_inserted(struct request *rq);
+extern bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
+		struct request **merged_request);
 
 /* helper functions for getting / setting configurations via sysfs */
 ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
@@ -50,6 +52,9 @@ struct k2_data {
 	/* further group real-time requests by I/O priority */
 	struct list_head rt_reqs[IOPRIO_BE_NR];
 	struct list_head be_reqs;
+
+	/* Sector-ordered lists for request merging */
+	struct rb_root sort_list[2];
 
 	spinlock_t lock;
 };
@@ -93,6 +98,44 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 	return(size);
 }
 
+static inline struct rb_root *
+k2_rb_root(struct k2_data *k2d, struct request *rq)
+{
+	return &k2d->sort_list[rq_data_dir(rq)];
+}
+
+static void
+k2_add_rq_rb(struct k2_data *k2d, struct request *rq)
+{
+	struct rb_root *root = k2_rb_root(k2d, rq);
+
+	elv_rb_add(root, rq);
+}
+
+static inline void
+k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
+{
+	elv_rb_del(k2_rb_root(k2d, rq), rq);
+}
+
+static void
+k2_remove_request(struct request_queue *q, struct request *r)
+{
+	struct k2_data *k2d = q->elevator->elevator_data;
+
+	list_del_init(&r->queuelist);
+
+	/*
+	 * During an insert merge r might have not been added to the rb-tree yet
+	 */
+	if (!RB_EMPTY_NODE(&r->rb_node))
+		k2_del_rq_rb(k2d, r);
+
+	elv_rqhash_del(q, r);
+	if (q->last_merge == r)
+		q->last_merge = NULL;
+}
+
 /* Initialize the scheduler. */
 static int k2_init_sched(struct request_queue *rq, struct elevator_type *et) 
 {
@@ -118,6 +161,10 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
 
 	INIT_LIST_HEAD(&k2d->be_reqs);
+
+	k2d->sort_list[READ] = RB_ROOT;
+	k2d->sort_list[WRITE] = RB_ROOT;
+
 	spin_lock_init(&k2d->lock);
 
 	rq->elevator = eq;
@@ -224,6 +271,7 @@ void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 			prio_class = task_nice_ioclass(current);
 		}
 
+		k2_add_rq_rb(k2d, r);
 		if (rq_mergeable(r)) {
 			elv_rqhash_add(q, r);
 			if (!q->last_merge)
@@ -281,14 +329,76 @@ abort:
 	return(NULL);
 
 end:
-	list_del_init(&r->queuelist);
-	elv_rqhash_del(q, r);
-	if (q->last_merge == r)
-		q->last_merge = NULL;
+	k2_remove_request(q, r);
 	k2d->inflight++;
 	r->rq_flags |= RQF_STARTED;
 	spin_unlock_irqrestore(&k2d->lock, flags);
 	return(r);
+}
+
+static bool k2_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+{
+	struct request_queue *q = hctx->queue;
+	struct k2_data *k2d = q->elevator->elevator_data;
+	struct request *free = NULL;
+	unsigned long flags;
+	bool ret;
+
+	spin_lock_irqsave(&k2d->lock, flags);
+	ret = blk_mq_sched_try_merge(q, bio, &free);
+	spin_unlock_irqrestore(&k2d->lock, flags);
+
+	if (free)
+		blk_mq_free_request(free);
+
+	return(ret);
+}
+
+static int k2_request_merge(struct request_queue *q, struct request **r, struct bio *bio)
+{
+	struct k2_data *k2d = q->elevator->elevator_data;
+	struct request *__rq;
+	sector_t sector = bio_end_sector(bio);
+
+	assert_spin_locked(&k2d->lock);
+
+	// should request merging cross I/O prios?
+
+	__rq = elv_rb_find(&k2d->sort_list[bio_data_dir(bio)], sector);
+	if (__rq) {
+		BUG_ON(sector != blk_rq_pos(__rq));
+
+		if (elv_bio_merge_ok(__rq, bio)) {
+			*r = __rq;
+			return(ELEVATOR_FRONT_MERGE);
+		}
+	}
+
+	return(ELEVATOR_NO_MERGE);
+}
+
+static void k2_request_merged(struct request_queue *q, struct request *req,
+			      enum elv_merge type)
+{
+	struct k2_data *k2d = q->elevator->elevator_data;
+
+	/*
+	 * if the merge was a front merge, we need to reposition request
+	 */
+	if (type == ELEVATOR_FRONT_MERGE) {
+		k2_del_rq_rb(k2d, req);
+		k2_add_rq_rb(k2d, req);
+	}
+}
+
+/*
+ * This function is called to notify the scheduler that the requests
+ * rq and 'next' have been merged, with 'next' going away.
+ */
+static void k2_requests_merged(struct request_queue *q, struct request *rq,
+				struct request *next)
+{
+	k2_remove_request(q, next);
 }
 
 static struct elevator_type k2_iosched = {
@@ -300,6 +410,11 @@ static struct elevator_type k2_iosched = {
 		.has_work          = k2_has_work,
 		.dispatch_request  = k2_dispatch_request,
 		.completed_request = k2_completed_request,
+
+		.bio_merge         = k2_bio_merge,
+		.request_merge     = k2_request_merge,
+		.request_merged    = k2_request_merged,
+		.requests_merged   = k2_requests_merged,
 	},
 	.uses_mq        = true,
 	.elevator_attrs = k2_attrs,
