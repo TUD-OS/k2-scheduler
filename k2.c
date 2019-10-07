@@ -200,6 +200,7 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
                         bool at_head) 
 {
+	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	unsigned long flags;
 
@@ -222,6 +223,13 @@ void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 		} else {
 			prio_class = task_nice_ioclass(current);
 		}
+
+		if (rq_mergeable(r)) {
+			elv_rqhash_add(q, r);
+			if (!q->last_merge)
+				q->last_merge = r;
+		}
+
        
 		if (prio_class == IOPRIO_CLASS_RT) {
 			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
@@ -240,6 +248,7 @@ void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 
 static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx) 
 {
+	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
 	struct request *r;
 	unsigned long flags;
@@ -273,6 +282,9 @@ abort:
 
 end:
 	list_del_init(&r->queuelist);
+	elv_rqhash_del(q, r);
+	if (q->last_merge == r)
+		q->last_merge = NULL;
 	k2d->inflight++;
 	r->rq_flags |= RQF_STARTED;
 	spin_unlock_irqrestore(&k2d->lock, flags);
