@@ -98,28 +98,25 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 	return(size);
 }
 
-static inline struct rb_root *
-k2_rb_root(struct k2_data *k2d, struct request *rq)
+static inline struct rb_root *k2_rb_root(struct k2_data *k2d, 
+						struct request *rq)
 {
 	return &k2d->sort_list[rq_data_dir(rq)];
 }
 
-static void
-k2_add_rq_rb(struct k2_data *k2d, struct request *rq)
+static void k2_add_rq_rb(struct k2_data *k2d, struct request *rq)
 {
 	struct rb_root *root = k2_rb_root(k2d, rq);
 
 	elv_rb_add(root, rq);
 }
 
-static inline void
-k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
+static inline void k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
 {
 	elv_rb_del(k2_rb_root(k2d, rq), rq);
 }
 
-static void
-k2_remove_request(struct request_queue *q, struct request *r)
+static void k2_remove_request(struct request_queue *q, struct request *r)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 
@@ -243,9 +240,21 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	return(has_work);
 }
 
+static void k2_ioprio_from_task(int *class, int *value) 
+{
+	if (current->io_context == NULL || 
+		!ioprio_valid(current->io_context->ioprio)) {
+		*class = task_nice_ioclass(current);
+		*value = IOPRIO_NORM;
+	} else {
+		*class = IOPRIO_PRIO_CLASS(current->io_context->ioprio);
+		*value = IOPRIO_PRIO_VALUE(*class, current->io_context->ioprio);
+	}
+}
+
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
-void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
-                        bool at_head) 
+static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
+				bool at_head) 
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
@@ -255,20 +264,17 @@ void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 	while (!list_empty(rqs)) {
 		struct request *r;
 		int    prio_class;
-		int    prio_value = IOPRIO_NORM;
+		int    prio_value;
 
 		r = list_first_entry(rqs, struct request, queuelist);
 		list_del_init(&r->queuelist);
 
 		/* if task has no io prio, derive it from its nice value */
-		if (current->io_context != NULL && 
-			ioprio_valid(current->io_context->ioprio)) {
-			prio_class = IOPRIO_PRIO_CLASS(
-						current->io_context->ioprio);
-			prio_value = IOPRIO_PRIO_VALUE(prio_class, 
-						current->io_context->ioprio);
+		if (ioprio_valid(r->ioprio)) {
+			prio_class = IOPRIO_PRIO_CLASS(r->ioprio);
+			prio_value = IOPRIO_PRIO_VALUE(prio_class, r->ioprio);
 		} else {
-			prio_class = task_nice_ioclass(current);
+			k2_ioprio_from_task(&prio_class, &prio_value);
 		}
 
 		k2_add_rq_rb(k2d, r);
@@ -277,7 +283,6 @@ void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 			if (!q->last_merge)
 				q->last_merge = r;
 		}
-
        
 		if (prio_class == IOPRIO_CLASS_RT) {
 			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
@@ -317,7 +322,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
-	/* no rt rqs waiting: choose other workload      */
+	/* no rt rqs waiting: choose other workload */
 	if (!list_empty(&k2d->be_reqs)) {
 		r = list_first_entry(&k2d->be_reqs, struct request, queuelist);
 		goto end;
@@ -354,7 +359,8 @@ static bool k2_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
 	return(ret);
 }
 
-static int k2_request_merge(struct request_queue *q, struct request **r, struct bio *bio)
+static int k2_request_merge(struct request_queue *q, struct request **r, 
+				struct bio *bio)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 	struct request *__rq;
@@ -378,7 +384,7 @@ static int k2_request_merge(struct request_queue *q, struct request **r, struct 
 }
 
 static void k2_request_merged(struct request_queue *q, struct request *req,
-			      enum elv_merge type)
+				enum elv_merge type)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
 
