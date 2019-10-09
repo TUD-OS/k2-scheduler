@@ -219,7 +219,7 @@ static bool _k2_has_work(struct k2_data *k2d)
 		return(true);
 
 	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (list_empty(&k2d->rt_reqs[i])) {
+		if (! list_empty(&k2d->rt_reqs[i])) {
 			return(true);
 		}
 	}
