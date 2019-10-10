@@ -12,6 +12,16 @@ performance of this scheduler see also the paper "K2: Work-Constraining
 Scheduling of NVMe-Attached Storage".
 
 
+Credits
+-------
+
+Only the initial version of the K2 I/O scheduler was entirely written by me.
+I would like to thank the following people for their contributions to this
+project:
+
+Hannes Weisbach, TU Dresden - Implementation of request merging, bug fixing.
+
+
 How to build and run the scheduler
 ----------------------------------
 
@@ -35,6 +45,9 @@ the sysfs file /sys/block/<device name>/queue/scheduler.
 Please note that K2 will only work with the multi-queue block layer of Linux.
 To enable this feature, add scsi_mod.use_blk_mq=1 to your bootloader 
 configuration. Reboot the system afterwards.
+If you wish to reset your build directory, you can do so by running
+
+make clean
 
 
 How to use K2
@@ -62,3 +75,12 @@ of K2 allows 32 requests to be in flight at the same time. Note that the lower
 the inflight parameter, the better the achieved I/O latency will be. However 
 this is accomplished at the expense of the throughput that this device will 
 offer.
+
+
+Versions
+--------
+
+To reproduce the measurements of the RTSS 2019 paper mentioned above, check out
+the tag k2-rtss19 on the master branch. The current version that can be found in
+the repository comprises features which were not present when writing the paper 
+such as request merging.
