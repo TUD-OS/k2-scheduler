@@ -297,18 +297,6 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	return(has_work);
 }
 
-static void k2_ioprio_from_task(int *class, int *value) 
-{
-	if (current->io_context == NULL || 
-		!ioprio_valid(current->io_context->ioprio)) {
-		*class = task_nice_ioclass(current);
-		*value = IOPRIO_NORM;
-	} else {
-		*class = IOPRIO_PRIO_CLASS(current->io_context->ioprio);
-		*value = IOPRIO_PRIO_VALUE(*class, current->io_context->ioprio);
-	}
-}
-
 /* Inserts a request into the scheduler queue. For now, at_head is ignored! */
 static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs,
 				bool at_head) 
