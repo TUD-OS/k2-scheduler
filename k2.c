@@ -27,6 +27,12 @@
 #include <linux/bio.h>
 #include <linux/blk-mq.h>
 #include <linux/ioprio.h>
+#include <linux/printk.h>
+
+#ifdef pr_fmt
+#undef pr_fmt
+#endif
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 /*
  * blk_mq_sched_request_inserted() is EXPORT_SYMBOL_GPL'ed, but it is declared
@@ -45,16 +51,31 @@ ssize_t k2_max_inflight_show(struct elevator_queue *eq, char *s);
 ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s, 
                             size_t size);
 
+#define K2_NUM_QUEUES    (IOPRIO_BE_NR  * 2 + 1)
+#define K2_NUM_SORTLISTS (K2_NUM_QUEUES * 2)
+
 struct k2_data {
 	unsigned int inflight;
 	unsigned int max_inflight;
 
-	/* further group real-time requests by I/O priority */
-	struct list_head rt_reqs[IOPRIO_BE_NR];
-	struct list_head be_reqs;
+	/*
+	 * K2 request queues:
+	 *   - 1 real-time class with 8 priority levels
+	 *   - 1 best effort class with 8 priority levels
+	 *   - 1 idle class with one level
+	 * ioprio to queue index mapping:
+	 * first 8 entries are the RT queues, followed by the 8 entries for the
+	 * best-effort queues. the last entry is the idle queue.
+	 * See k2_queue_idx() for ioprio to index mapping.
+	 */
+	struct list_head queues[K2_NUM_QUEUES];
 
-	/* Sector-ordered lists for request merging */
-	struct rb_root sort_list[2];
+	/* Sector-ordered lists for request front merging, one for each priority.
+	 * Priority-to-index-encoding is the same as for the request queues.
+	 * Request merging is done per request type (read or write), hence
+	 * twice the number of lists.
+	 */
+	struct rb_root sort_list[K2_NUM_SORTLISTS];
 
 	spinlock_t lock;
 };
@@ -98,22 +119,58 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 	return(size);
 }
 
-static inline struct rb_root *k2_rb_root(struct k2_data *k2d, 
-						struct request *rq)
+static unsigned k2_queue_idx(const unsigned short ioprio)
 {
-	return &k2d->sort_list[rq_data_dir(rq)];
+	const unsigned class = IOPRIO_PRIO_CLASS(ioprio);
+	const unsigned data = IOPRIO_PRIO_DATA(ioprio);
+	const unsigned idx = (class - 1) * IOPRIO_BE_NR + data;
+
+	BUG_ON(!ioprio_valid(ioprio));
+
+	return idx;
 }
 
-static void k2_add_rq_rb(struct k2_data *k2d, struct request *rq)
+static struct list_head *
+k2_queue(struct k2_data * const k2d, const unsigned short ioprio)
 {
-	struct rb_root *root = k2_rb_root(k2d, rq);
+	const unsigned idx = k2_queue_idx(ioprio);
 
+	return &k2d->queues[idx];
+}
+
+static struct rb_root *
+k2_rb_root(struct k2_data * const k2d, const unsigned short ioprio, const int data_dir)
+{
+	const unsigned idx_ = k2_queue_idx(ioprio);
+	const unsigned idx = data_dir * K2_NUM_QUEUES + idx_;
+
+	return &k2d->sort_list[idx];
+}
+
+static struct rb_root *
+k2_rb_root_req(struct k2_data * const k2d, const struct request * const r)
+{
+	return k2_rb_root(k2d, r->ioprio, rq_data_dir(r));
+}
+
+static struct rb_root *
+k2_rb_root_bio(struct k2_data * const k2d, const struct bio * const bio)
+{
+	return k2_rb_root(k2d, bio_prio(bio), bio_data_dir(bio));
+}
+
+static void
+k2_add_rq_rb(struct k2_data * const k2d, struct request *const rq)
+{
+	struct rb_root *root = k2_rb_root_req(k2d, rq);
 	elv_rb_add(root, rq);
 }
 
-static inline void k2_del_rq_rb(struct k2_data *k2d, struct request *rq)
+static void
+k2_del_rq_rb(struct k2_data * const k2d, struct request * const rq)
 {
-	elv_rb_del(k2_rb_root(k2d, rq), rq);
+	struct rb_root *root = k2_rb_root_req(k2d, rq);
+	elv_rb_del(root, rq);
 }
 
 static void k2_remove_request(struct request_queue *q, struct request *r)
@@ -154,13 +211,14 @@ static int k2_init_sched(struct request_queue *rq, struct elevator_type *et)
 
 	k2d->inflight     =  0;
 	k2d->max_inflight = 32;
-	for (i = 0; i < IOPRIO_BE_NR; i++)
-		INIT_LIST_HEAD(&k2d->rt_reqs[i]);
 
-	INIT_LIST_HEAD(&k2d->be_reqs);
+	for (i = 0; i < K2_NUM_QUEUES; ++i) {
+		INIT_LIST_HEAD(&k2d->queues[i]);
+	}
 
-	k2d->sort_list[READ] = RB_ROOT;
-	k2d->sort_list[WRITE] = RB_ROOT;
+	for (i = 0; i < K2_NUM_SORTLISTS; ++i) {
+		k2d->sort_list[i] = RB_ROOT;
+	}
 
 	spin_lock_init(&k2d->lock);
 
@@ -183,6 +241,8 @@ static void k2_completed_request(struct request *r)
 	unsigned long flags;
 	unsigned int  counter;
 	unsigned int  max_inf; 
+
+	pr_info("Req %px completed\n", r);
 
 	spin_lock_irqsave(&k2d->lock, flags);
 	/* avoid negative counters */
@@ -215,11 +275,8 @@ static bool _k2_has_work(struct k2_data *k2d)
 	if (k2d->inflight >= k2d->max_inflight)
 		return(false);
 
-	if (! list_empty(&k2d->be_reqs))
-		return(true);
-
-	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (! list_empty(&k2d->rt_reqs[i])) {
+	for (i = 0; i < K2_NUM_QUEUES; ++i) {
+		if (! list_empty(&k2d->queues[i])) {
 			return(true);
 		}
 	}
@@ -236,7 +293,7 @@ static bool k2_has_work(struct blk_mq_hw_ctx *hctx)
 	spin_lock_irqsave(&k2d->lock, flags);
 	has_work = _k2_has_work(k2d);
 	spin_unlock_irqrestore(&k2d->lock, flags);
-    
+
 	return(has_work);
 }
 
@@ -258,39 +315,27 @@ static void k2_insert_requests(struct blk_mq_hw_ctx *hctx, struct list_head *rqs
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
+	struct list_head *cur, *tmp;
+
 	unsigned long flags;
 
 	spin_lock_irqsave(&k2d->lock, flags);
-	while (!list_empty(rqs)) {
-		struct request *r;
-		int    prio_class;
-		int    prio_value;
+	list_for_each_safe(cur, tmp, rqs) {
+		struct request *r = list_entry(cur, struct request, queuelist);
+		const unsigned ioprio = r->ioprio;
 
-		r = list_first_entry(rqs, struct request, queuelist);
-		list_del_init(&r->queuelist);
+		// Add request to per-prio FIFO queue
+		struct list_head * queue = k2_queue(k2d, ioprio);
+		list_move_tail(cur, queue);
 
-		/* if task has no io prio, derive it from its nice value */
-		if (ioprio_valid(r->ioprio)) {
-			prio_class = IOPRIO_PRIO_CLASS(r->ioprio);
-			prio_value = IOPRIO_PRIO_VALUE(prio_class, r->ioprio);
-		} else {
-			k2_ioprio_from_task(&prio_class, &prio_value);
-		}
-
+		// keep per-prio sector-ordered lists for merging
 		k2_add_rq_rb(k2d, r);
 		if (rq_mergeable(r)) {
 			elv_rqhash_add(q, r);
 			if (!q->last_merge)
 				q->last_merge = r;
-		}
-       
-		if (prio_class == IOPRIO_CLASS_RT) {
-			if (prio_value >= IOPRIO_BE_NR || prio_value < 0)
-				prio_value = IOPRIO_NORM;
-
-			list_add_tail(&r->queuelist, &k2d->rt_reqs[prio_value]);
 		} else {
-			list_add_tail(&r->queuelist, &k2d->be_reqs);
+			pr_info("Request not mergeable\n");
 		}
 
 		/* leave a message for tracing */
@@ -303,7 +348,7 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct request_queue *q = hctx->queue;
 	struct k2_data *k2d = hctx->queue->elevator->elevator_data;
-	struct request *r;
+	struct request *r = NULL;
 	unsigned long flags;
 	unsigned int  i;
 
@@ -311,32 +356,22 @@ static struct request *k2_dispatch_request(struct blk_mq_hw_ctx *hctx)
     
 	/* inflight counter may have changed since last call to has_work */
 	if (k2d->inflight >= k2d->max_inflight)
-		goto abort;
+		goto unlock_out;
     
 	/* always prefer real-time requests */
-	for (i = 0; i < IOPRIO_BE_NR; i++) {
-		if (!list_empty(&k2d->rt_reqs[i])) {
-			r = list_first_entry(&k2d->rt_reqs[i], struct request, 
+	for (i = 0; i < K2_NUM_QUEUES; ++i) {
+		r = list_first_entry_or_null(&k2d->queues[i], struct request, 
 					     queuelist);
-			goto end;
+		if(r != NULL) {
+			break;
 		}
 	}
 
-	/* no rt rqs waiting: choose other workload */
-	if (!list_empty(&k2d->be_reqs)) {
-		r = list_first_entry(&k2d->be_reqs, struct request, queuelist);
-		goto end;
-	}
-
-abort:
-	/* both request lists are empty or inflight counter is too high */
-	spin_unlock_irqrestore(&k2d->lock, flags);    
-	return(NULL);
-
-end:
 	k2_remove_request(q, r);
 	k2d->inflight++;
 	r->rq_flags |= RQF_STARTED;
+
+unlock_out:
 	spin_unlock_irqrestore(&k2d->lock, flags);
 	return(r);
 }
@@ -359,25 +394,77 @@ static bool k2_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
 	return(ret);
 }
 
-static int k2_request_merge(struct request_queue *q, struct request **r, 
-				struct bio *bio)
+/*
+ * Tell the MQ-Layer if it is ok to merge bio with r.
+ * Callback from the path of blk_mq_sched_try_merge, which we call in k2_bio_merge.
+ * Future versions of the kernel, will check ioprio before merging, but not our kernel
+ * version target of 4.15.
+ * Note: elv_merge gets r from q->last_merge, or the out-param from k2_request_merge.
+ * (we don't use the elv_rbhash-infrastructure)
+ */
+static bool k2_allow_bio_merge(struct request_queue *q, struct request * r, struct bio * bio)
+{
+	return r->ioprio == bio_prio(bio);
+}
+
+/*
+ * Find a back-merge with the correct I/O-prio
+ */
+static struct request *
+k2_find_backmerge(struct request_queue * q, struct bio * const  bio)
+{
+#define ELV_ON_HASH(rq) ((rq)->rq_flags & RQF_HASHED)
+#define rq_hash_key(rq)	(blk_rq_pos(rq) + blk_rq_sectors(rq))
+
+	struct elevator_queue *e = q->elevator;
+	struct hlist_node *next;
+	struct request *r;
+	const sector_t sector = bio->bi_iter.bi_sector;
+	const unsigned ioprio = bio_prio(bio);
+
+	hash_for_each_possible_safe(e->hash, r, next, hash, sector) {
+		BUG_ON(!ELV_ON_HASH(r));
+
+		if (unlikely(!rq_mergeable(r))) {
+			elv_rqhash_del(q, r);
+			continue;
+		}
+
+		if (rq_hash_key(r) == sector && r->ioprio == ioprio)
+			return r;
+	}
+
+	return NULL;
+}
+
+
+static int k2_request_merge(struct request_queue *q, struct request **r, struct bio *bio)
 {
 	struct k2_data *k2d = q->elevator->elevator_data;
-	struct request *__rq;
-	sector_t sector = bio_end_sector(bio);
+	struct rb_root * root = k2_rb_root_bio(k2d, bio);
+	struct request *__rq = NULL;
+	const sector_t end_sector = bio_end_sector(bio);
 
 	assert_spin_locked(&k2d->lock);
 
-	// should request merging cross I/O prios?
+	/*
+	 * check for back merges. elv_* might not have found one (multiple prios),
+	 * or we might have denied one in k2_allow_bio_merge
+	 */
+	__rq = k2_find_backmerge(q, bio);
+	if(__rq && elv_bio_merge_ok(__rq, bio)) {
+		// the first sector of bio better be one after the last sector of __rq!
+		BUG_ON((blk_rq_pos(__rq) + blk_rq_sectors(__rq) != bio->bi_iter.bi_sector));
+		*r = __rq;
+		return(ELEVATOR_BACK_MERGE);
+	}
 
-	__rq = elv_rb_find(&k2d->sort_list[bio_data_dir(bio)], sector);
-	if (__rq) {
-		BUG_ON(sector != blk_rq_pos(__rq));
-
-		if (elv_bio_merge_ok(__rq, bio)) {
-			*r = __rq;
-			return(ELEVATOR_FRONT_MERGE);
-		}
+	__rq = elv_rb_find(root, end_sector);
+	if (__rq && elv_bio_merge_ok(__rq, bio)) {
+		// one past the last sector of the new bio has to be first sector of __rq.
+		BUG_ON(end_sector != blk_rq_pos(__rq));
+		*r = __rq;
+		return(ELEVATOR_FRONT_MERGE);
 	}
 
 	return(ELEVATOR_NO_MERGE);
@@ -389,7 +476,9 @@ static void k2_request_merged(struct request_queue *q, struct request *req,
 	struct k2_data *k2d = q->elevator->elevator_data;
 
 	/*
-	 * if the merge was a front merge, we need to reposition request
+	 * if the merge was a front merge, we need to reposition request, because the
+	 * request has a new first sector and the rb-tree is ordered by first sector
+	 * of the requests.
 	 */
 	if (type == ELEVATOR_FRONT_MERGE) {
 		k2_del_rq_rb(k2d, req);
@@ -417,6 +506,7 @@ static struct elevator_type k2_iosched = {
 		.dispatch_request  = k2_dispatch_request,
 		.completed_request = k2_completed_request,
 
+		.allow_merge       = k2_allow_bio_merge,
 		.bio_merge         = k2_bio_merge,
 		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
