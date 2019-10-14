@@ -156,19 +156,28 @@ static unsigned k2_ioprio(const unsigned short ioprio)
 }
 
 static struct list_head *k2_queue(struct k2_data *const k2d,
-				  const unsigned short ioprio)
+				  const unsigned ioprio)
 {
-	return &k2d->queues[(ioprio < K2_NUM_QUEUES) ? ioprio :
-						       K2_NUM_QUEUES - 1];
+	if (unlikely(!(ioprio < K2_NUM_QUEUES))) {
+		pr_warn_ratelimited(
+			"Invalid I/O priority, degrading to IDLE priority.\n");
+	}
+
+	return &k2d->queues[max(ioprio, K2_NUM_QUEUES - 1U)];
 }
 
 static struct rb_root *k2_rb_root(struct k2_data *const k2d,
-				  const unsigned short ioprio,
-				  const int data_dir)
+				  const unsigned ioprio, const int data_dir)
 {
-	const unsigned idx = data_dir * K2_NUM_QUEUES + ioprio;
+	const unsigned idx =
+		data_dir * K2_NUM_QUEUES + max(ioprio, K2_NUM_QUEUES - 1U);
 
-	BUG_ON(idx >= K2_NUM_SORTLISTS);
+	BUG_ON(data_dir != READ && data_dir != WRITE);
+
+	if (unlikely(!(ioprio < K2_NUM_QUEUES))) {
+		pr_warn_ratelimited(
+			"Invalid I/O priority, degrading to IDLE priority.\n");
+	}
 
 	return &k2d->sort_list[idx];
 }
