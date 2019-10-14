@@ -444,13 +444,28 @@ static struct request *k2_find_backmerge(struct request_queue *q,
 	return NULL;
 }
 
-static struct request *k2_find_frontmerge(struct k2_data *const k2d,
+static struct request *k2_find_frontmerge(struct request_queue *q,
 					  const struct bio *const bio)
 {
+	struct k2_data *const k2d = q->elevator->elevator_data;
 	const unsigned k2_prio = k2_ioprio(bio_prio(bio));
 	struct rb_root *root = k2_rb_root(k2d, k2_prio, bio_data_dir(bio));
+	const sector_t sector = bio_end_sector(bio);
+	struct request *r;
 
-	return elv_rb_find(root, bio_end_sector(bio));
+	/*
+	 * look at all the requests with the start sector "sector" and return
+	 * the first one that fits our I/O prio, or NULL if there are none.
+	 */
+	for (r = elv_rb_find(root, sector);
+	     r != NULL && blk_rq_pos(r) == sector;
+	     r = elv_rb_latter_request(q, r)) {
+		if (K2_REQUEST_IOPRIO(r) == k2_prio) {
+			return r;
+		}
+	}
+
+	return NULL;
 }
 
 static int k2_request_merge(struct request_queue *q, struct request **r,
@@ -474,7 +489,7 @@ static int k2_request_merge(struct request_queue *q, struct request **r,
 		return (ELEVATOR_BACK_MERGE);
 	}
 
-	__rq = k2_find_frontmerge(k2d, bio);
+	__rq = k2_find_frontmerge(q, bio);
 	if (__rq && elv_bio_merge_ok(__rq, bio)) {
 		// one past the last sector of the new bio has to be first sector of __rq.
 		BUG_ON(bio_end_sector(bio) != blk_rq_pos(__rq));
