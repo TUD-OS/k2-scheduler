@@ -125,20 +125,34 @@ ssize_t k2_max_inflight_set(struct elevator_queue *eq, const char *s,
 	return(size);
 }
 
-static unsigned k2_ioprio(const unsigned short ioprio)
+static unsigned k2_idx_from_ioprio_nocheck(const unsigned short ioprio)
 {
-	unsigned class = IOPRIO_PRIO_CLASS(ioprio);
-	unsigned data = IOPRIO_PRIO_DATA(ioprio);
-	unsigned idx;
+	const unsigned class = IOPRIO_PRIO_CLASS(ioprio);
+	const unsigned data = IOPRIO_PRIO_DATA(ioprio);
 
-	if (!ioprio_valid(ioprio)) {
-		class = task_nice_ioclass(current);
-		data = task_nice_ioprio(current);
-	}
-
-	idx = (class - 1) * IOPRIO_BE_NR + data;
+	const unsigned idx = (class - 1) * IOPRIO_BE_NR + data;
 
 	return idx;
+}
+
+static unsigned k2_ioprio(const unsigned short ioprio)
+{
+	if (ioprio_valid(ioprio)) {
+		return k2_idx_from_ioprio_nocheck(ioprio);
+	} else {
+		/* try to get ioprio from io_context. */
+		struct io_context *ioc = current->io_context;
+		if (ioc) {
+			const unsigned iocp = READ_ONCE(ioc->ioprio);
+			if (ioprio_valid(iocp)) {
+				return k2_idx_from_ioprio_nocheck(iocp);
+			}
+		}
+	}
+
+	// Fallback to deriving I/O prio from task priority, if everything else fails.
+	return k2_idx_from_ioprio_nocheck(IOPRIO_PRIO_VALUE(
+		task_nice_ioclass(current), task_nice_ioprio(current)));
 }
 
 static struct list_head *k2_queue(struct k2_data *const k2d,
