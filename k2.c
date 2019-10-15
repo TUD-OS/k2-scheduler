@@ -564,7 +564,7 @@ static struct elevator_type k2_iosched = {
 
 		.allow_merge       = k2_allow_bio_merge,
 		.bio_merge         = k2_bio_merge,
-		//.request_merge     = k2_request_merge,
+		.request_merge     = k2_request_merge,
 		.request_merged    = k2_request_merged,
 		.requests_merged   = k2_requests_merged,
 		.former_request    = elv_rb_former_request,
